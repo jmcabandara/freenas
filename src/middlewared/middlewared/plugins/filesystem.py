@@ -1,5 +1,6 @@
 import binascii
 import bsd
+from bsd import acl
 import errno
 import grp
 import os
@@ -8,9 +9,9 @@ import select
 import shutil
 
 from middlewared.main import EventSource
-from middlewared.schema import Bool, Dict, Int, Ref, Str, accepts
+from middlewared.schema import Bool, Dict, Int, Ref, List, Str, accepts
 from middlewared.service import private, CallError, Service, job
-from middlewared.utils import filter_list
+from middlewared.utils import filter_list, acl_tools, run
 
 
 class FilesystemService(Service):
@@ -226,6 +227,106 @@ class FilesystemService(Service):
             'free_bytes': statfs.free_blocks * statfs.blocksize,
             'avail_bytes': statfs.avail_blocks * statfs.blocksize,
         }
+
+    @accepts(
+        Str('path'),
+        Bool('simplified', default=True),
+    )
+    def getacl(self, path, simplified=True):
+        """
+        Return ACL of a given path.
+        Simplified returns a shortened form of the ACL permset and flags
+        - TRAVERSE = sufficient rights to traverse a directory, but not read contents.
+        - READ = sufficient rights to traverse a directory, and read file contents.
+        - MODIFIY = sufficient rights to traverse, read, write, and modify a file. Equivalent to modify_set.
+        - FULL_CONTROL = all permissions.
+        - SPECIAL = does not fit into any of the above categories.
+        """
+        a = acl.ACL(file=path)
+        fs_acl = a.__getstate__()
+
+        if not simplified:
+            return fs_acl
+                
+        if simplified:
+            simple_acl = []
+            for entry in fs_acl:
+                ace = {
+                    'tag': entry['tag'],
+                    'id': entry['id'],
+                    'type': entry['type'],
+                    'perms': acl_tools.convert_advanced_simple(entry['perms']),
+                    'flags': acl_tools.convert_advanced_simple(entry['flags']),
+                }
+                simple_acl.append(ace)
+
+            return simple_acl
+
+    @accepts(
+        Str('path'),
+        List('dacl', items=['tag', 'id', 'type', 'perms', 'flags'], default=[]),
+        Dict(
+            'options',
+            Bool('stripacl', default=False),
+            Bool('recursive', default=False),
+            Bool('traverse', default=False),
+        )
+    )
+    def setacl(self, path, dacl, options):
+        """
+        Set ACL of a given path. Takes the following parameters:
+        :path: realpath or relative path. We make a subsequent realpath call to resolve it.
+        :dacl: Accept a "simplified" ACL here or a full ACL. If the simplified ACL
+        contains ACE perms or flags that are "SPECIAL", then raise a validation error.
+        :recursive: apply the ACL recursively
+        :traverse: traverse filestem boundaries (ZFS datasets)
+        :strip: convert ACL to trivial. ACL is trivial if it can be expressed as a file mode without
+        losing any access rules.
+        Returns 'True' on success or raises an exception.
+        """
+        if not os.path.exists(path):
+            raise CallError('Path not found.', errno.ENOENT)
+
+        if dacl and options['stripacl']:
+            raise CallError('Setting ACL and stripping ACL are not permitted simultaneously.', errno.EINVAL)
+
+        if options['stripacl']:
+            a = acl.ACL(file=path)
+            a.strip()
+            a.apply(path)
+        else:
+            cleaned_acl = []
+            for entry in dacl:
+                if 'SPECIAL' in (entry['perms'], entry['flags']):
+                    raise CallError('Unable to apply simplified ACL due to SPECIAL entry. Use full ACL.', errno.EINVAL)
+                ace = {
+                    'tag': entry['tag'],
+                    'id': entry['id'],
+                    'type': entry['type'],
+                    'perms': acl_tools.convert_simple_advanced(entry['perms']) if type(entry['perms']) == str else entry['perms'],
+                    'flags': acl_tools.convert_simple_advanced(entry['flags']) if type(entry['perms']) == str else entry['flags'],
+                }
+                self.logger.debug(ace)
+                cleaned_acl.append(ace)
+            a = acl.ACL()
+            a.__setstate__(cleaned_acl)
+            a.apply(path)
+
+        if not options['recursive']:
+            return True
+
+        winacl = run([
+            '/usr/local/bin/winacl'
+            '-a', 'clone'
+            '-r', '-x',
+            '-p', path
+            ],
+            check=False
+        )
+        if winacl.returncode != 0:
+            raise CallError(f"Failed to recursively apply ACL: {winacl.sterr.decode()}")
+
+        return True
 
 
 class FileFollowTailEventSource(EventSource):
